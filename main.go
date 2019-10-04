@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ghodss/yaml"
 	"github.com/gourmetproject/dnsanalyzer/dnsresult"
 	"github.com/gourmetproject/gourmet"
 	"io/ioutil"
@@ -15,12 +16,12 @@ import (
 
 type Config struct {
 	Threshold int
-	Token     string `yaml:"bedtime_bot_token"`
-	User      string `yaml:"my_user_id"`
+	Token     string `json:"bedtime_bot_token"`
+	User      string `json:"my_user_id"`
 }
 
 var (
-	config *Config
+	config Config
 	counter int
 	threshold = 10
 	notified bool
@@ -28,19 +29,22 @@ var (
 )
 
 func init() {
-	var c interface{}
-	var ok bool
-	var err error
-	c, err = gourmet.GetAnalyzerConfig("github.com/gourmetproject/bedtimeanalyzer")
+	configBytes, err := gourmet.GetAnalyzerConfig("github.com/gourmetproject/bedtimeanalyzer")
 	if err != nil {
 		initFail = true
 		log.Fatal(err)
 	}
-	config, ok = c.(*Config)
-	if !ok {
+	err = yaml.Unmarshal(configBytes, &config)
+	if err != nil {
 		initFail = true
-		log.Fatal(errors.New("failed to cast results of GetAnalyzerConfig to bedtimeanalyzer.Config"))
+		log.Fatal(err)
 	}
+}
+
+type bedtimeResult struct{}
+
+func (br *bedtimeResult) Key() string {
+	return "netflix_detector"
 }
 
 type bedtimeAnalyzer struct{}
@@ -51,8 +55,8 @@ func NewAnalyzer() gourmet.Analyzer {
 
 // lateNightNetflixAnalyzer filters on DNS packets that have:
 //   1. Already been analyzed by the Gourmet DNS analyzer
-//   2. Occur after 9pm
-//   3. We haven't sent a Slack notification yet today
+//   2. Occur after 9pm and before 6am
+//   3. We haven't sent a Slack notification yet
 func (bta *bedtimeAnalyzer) Filter(c *gourmet.Connection) bool {
 	if notified || initFail {
 		return false
@@ -60,7 +64,7 @@ func (bta *bedtimeAnalyzer) Filter(c *gourmet.Connection) bool {
 	_, ok := c.Analyzers["dns"]; if ok {
 		// time.Clock() returns the hour, minute, and second for a timestamp
 		hour, _, _ := c.Timestamp.Clock()
-		if hour > 21 {
+		if hour > 21 || hour < 6 {
 			return true
 		}
 	}
@@ -68,29 +72,28 @@ func (bta *bedtimeAnalyzer) Filter(c *gourmet.Connection) bool {
 }
 
 func (bta *bedtimeAnalyzer) Analyze(c *gourmet.Connection) (gourmet.Result, error) {
-	dnsResult, ok := c.Analyzers["dns"].(dnsresult.DNS); if !ok {
+	dnsResult, ok := c.Analyzers["dns"].(*dnsresult.DNS); if !ok {
 		log.Println("DNS Analyzer Result invalid")
 	}
-	for _, answer := range dnsResult.Answers {
-		if strings.Contains(answer.Name, "netflix.com") {
-			counter++
-			if counter >= threshold {
-				hr, min, _ := c.Timestamp.Clock()
-				msg := fmt.Sprintf("%s is watching Netflix at %d:%d!", c.DestinationIP, hr, min)
+	if len(dnsResult.Answers) > 0 {
+		for _, answer := range dnsResult.Answers {
+			if strings.Contains(answer.Name, "netflix") {
+				msg := fmt.Sprintf("%s is watching Netflix at %s!", c.DestinationIP, c.Timestamp.Format("3:04PM"))
 				err := sendSlackNotification(config.Token, config.User, msg)
 				if err != nil {
 					log.Println(err)
 				} else {
 					notified = true
+					break
 				}
-				counter = 0
 			}
 		}
 	}
-	return nil, nil
+	return &bedtimeResult{}, nil
 }
 
 type Message struct {
+	Token   string `json:"token"`
 	Channel string `json:"channel"`
 	Text    string `json:"text"`
 }
@@ -103,6 +106,7 @@ type MessageResponse struct {
 func sendSlackNotification(token, channel, message string) (err error) {
 	var mr MessageResponse
 	messageBody := &Message {
+		Token: token,
 		Channel: channel,
 		Text: message,
 	}
@@ -111,9 +115,13 @@ func sendSlackNotification(token, channel, message string) (err error) {
 		return err
 	}
 	req, err := http.NewRequest("POST", "https://slack.com/api/chat.postMessage", bytes.NewBuffer(marshaledMessage))
+	if err != nil {
+		return err
+	}
 	header := http.Header{}
 	header.Add("Authorization", fmt.Sprintf("Bearer %s", token))
-	header.Add("Content-type", "application/json")
+	header.Add("Content-Type", "application/json")
+	req.Header = header
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
